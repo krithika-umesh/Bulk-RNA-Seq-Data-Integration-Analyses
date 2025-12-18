@@ -1,0 +1,350 @@
+---
+title: "AD Analysis"
+output:
+  html_document:
+    df_print: paged
+---
+
+This is an [R Markdown](http://rmarkdown.rstudio.com) Notebook. When you execute code within the notebook, the results appear beneath the code.
+
+Try executing this chunk by clicking the *Run* button within the chunk or by placing your cursor inside it and pressing *Ctrl+Shift+Enter*.
+
+```{r, setup, include=FALSE}
+library(edgeR)
+library(AnnotationDbi)
+library(org.Mm.eg.db)
+library(clusterProfiler)
+library(pheatmap)
+library(DESeq2)
+library(ggplot2)
+library(reshape2)
+library(RColorBrewer)
+library(dplyr)
+library(sva)
+
+```
+
+**Read the datasets** *The datasets are from 2 parts of brain i.e. mid & hind brain and Forebrain (cerebrum) and the data is collected after 1 month of simulated microgravity/spaceflight*
+
+```{r, read datasets, echo=FALSE, cache=TRUE}
+#read first dataset
+data_1 <- read.csv("C:/Users/krith/Downloads/GLDS-202_rna_seq_Unnormalized_Counts.csv")
+head(data_1)
+class(data_1)
+#subset the control group
+data1_sub <- data_1[,c(1,14,15,16,17,18,19)]
+head(data1_sub)
+
+#read second dataset
+data_2 <- read.csv("C:/Users/krith/Downloads/GLDS-457_rna_seq_STAR_Unnormalized_Counts.csv")
+head(data_2)
+#subset control group
+data2_sub <- data_2[,c('X',
+'GSM4614091',
+'GSM4614093',
+'GSM4614094',
+'GSM4614095',
+'GSM4614096',
+'GSM4614098'
+)]
+head(data2_sub)
+
+```
+
+**Merge the control groups from both the datasets** **Clean the data by removing NA values and deleting duplicated rownames**
+
+```{r, merge datasets, echo=FALSE, cache=TRUE}
+data_combined <- merge(data1_sub,data2_sub, by='X', all=TRUE)
+head(data_combined)
+#Convert column1 to rownames
+rownames(data_combined) <- data_combined[,1]
+data_combined <- data_combined[,-1]
+
+#check for duplicated rownames
+anyDuplicated(rownames(data_combined))
+
+#get the summary of the data
+summary(data_combined)
+#check for missing values
+any(rowSums(is.na(data_combined)) > 0)
+any(colSums(is.na(data_combined)) > 0)
+sum(is.na(data_combined))
+##remove NA values since each dataset is having the same number of NAs
+data_clean <- na.omit(data_combined)
+str(data_clean)
+
+```
+
+*The above image shows the structure of cleaned data containing 52125 observations and 6 variables.*
+
+**Convert the Ensembl ids to gene names**
+
+```{r, Convert ensembl ids to gene names, cache=TRUE, echo=FALSE}
+#Use AnnotationDbi to mapIDs to gene symbols
+#If IDs are mapped to multiple genes retain the first one
+gene_symbols <- mapIds(
+org.Mm.eg.db,
+keys = rownames(data_clean),
+column = "SYMBOL",
+keytype = "ENSEMBL",
+multiVals = "first"
+)
+#Check for duplicated values in gene symbols
+sum(duplicated(gene_symbols))  # Should be 0 to proceed
+#Resolve duplicates, keep the first occurrence
+gene_symbols <- make.unique(gene_symbols)
+#check if there are any NA values in the gene_symbol list
+sum(is.na(gene_symbols))
+#Replace the NA value with a placeholder
+gene_symbols[is.na(gene_symbols)] <- "Unknown"
+#Confirm that the length of gene_symbols matches the number of rows in data_clean. If the condition is not met, it returns an error
+stopifnot(length(gene_symbols) == nrow(data_clean))
+#Assign genes_symbols as rownames
+rownames(data_clean) <- gene_symbols
+head(rownames(data_clean))
+
+```
+**Create a DESeq2 dds object for exploratory and downstream analysis**
+
+```{r, Create DESeq2 dds object, cache=TRUE, echo=FALSE}
+#After mapping the ids to gene_symbols define batches i.e. experimental conditions
+batch <- factor(c(rep("Mid_Hind_brain", 6), rep("Forebrain_Cerebrum", 6)))
+#create metadata table
+metadata <- data.frame(
+sample = colnames(data_clean),
+batch = batch
+)
+#Assign the samples to rownames
+rownames(metadata) <- metadata$sample
+#delete the first column and include drop=FALSE to preserve the df str
+metadata <- metadata[,-1, drop=FALSE]
+
+#check if all the values in the counts are integers
+all_integers <- all(data_clean == floor(data_clean))
+#the print command should return true
+print(all_integers)
+#If false round off to the nearest integer
+data_clean <- round(data_clean)
+
+#Apply batch-effect correction
+data_corrected <- ComBat_seq(as.matrix(data_clean), batch = metadata$batch)
+
+#PCA after batch-effect correction
+pca <- prcomp(t(data_corrected))
+pca_df <- data.frame(PC1 = pca$x[,1], PC2 = pca$x[,2], batch = metadata$batch)
+
+ggplot(pca_df, aes(x = PC1, y = PC2, color = batch, shape = batch)) +
+    geom_point(size = 3) +
+    theme_minimal() +
+    labs(title = "PCA after Batch Correction")
+
+```
+
+**Log-transform data and visualize distribution through various plots**
+
+```{r, rlog transformation, cache=TRUE, echo=FALSE}
+#ceate metadata table for dds object
+metadata_dds <- data.frame(
+sample = colnames(data_corrected),
+batch = batch
+)
+rownames(metadata_dds) <- metadata_dds$sample
+metadata_dds$sample <- NULL
+
+
+#create dds object
+dds <- DESeqDataSetFromMatrix(
+countData = round(data_corrected),
+colData = metadata_dds,
+design = ~ batch
+)
+#normalization using regularized log transformation
+rld <- rlog(dds)
+head(assay(rld), 3)
+
+#View the transformed counts
+rlog_counts <- assay(rlog(dds))
+df_rlog <- as.data.frame(rlog_counts)
+#Scatterplot between 2 samples
+ggplot(df_rlog, aes(x = Mmus_C57.6J_BRN_HLLC_IRC_1mon_Rep1_M62, y = GSM4614098)) +
+geom_point(alpha = 0.5) +
+labs(title = "Scatterplot of rlog Counts", x = "Sample1", y = "Sample2") +
+theme_minimal()
+
+#Expression distribution
+boxplot(df_rlog, main = "Expression Distribution Across Samples",
+xlab = "Samples", ylab = "rlog Transformed Counts",
+las = 2, col = "lightblue")
+
+#Density plot to compare overall distribution of samples
+df_melted <- melt(as.data.frame(rlog_counts), variable.name = "Sample", value.name = "Expression")
+ggplot(df_melted, aes(x = Expression, color = Sample, fill = Sample)) +
+geom_density(alpha = 0.3) +
+labs(title = "Density Plot of rlog Transformed Expression", x = "Expression", y = "Density") +
+theme_minimal()
+
+#Violin plot to visualize sample specific density distribution
+ggplot(df_melted, aes(x = Sample, y = Expression, fill = Sample)) +
+geom_violin(trim = TRUE, alpha = 0.5) +
+labs(title = "Violin Plot of rlog Transformed Expression", x = "Samples", y = "Expression") +
+theme_minimal() +
+theme(axis.text.x = element_text(angle = 90, hjust = 1))
+
+```
+
+**Scatter plot:** *The sample1 on the x-axis is from the cerebellum area and sample 2 is from cerebrum area. The plot shows almost perfect correlation between the samples. The slight deviation might indicate biological variation or outliers.*
+
+**Box plot:** *The box plot shows the median of all the samples to be at 0. This indicates that the data is right-skewed. All the samples have several outliers.*
+
+**Density plot:** *The density plot also shows a skewed distribution of samples and data peak at 0 indicating that many genes have low/no expression across the samples.*
+
+**Violin plot:** *The violin plot also shows the median expression value of all samples to be 0 indicated by higher density of values. It shows a similar expression levels across the samples. The outliers, as with boxplot might indicate genes with variable expression specific to the samples.*
+
+
+**Visualize the distance between the samples using heatmap and PCA plot**
+
+```{r, Sample Distances, cache=TRUE, echo=FALSE}
+#Calculate Euclidean distances between samples
+sample_dists <- dist(t(assay(rld)))
+sample_dists
+#Visualize using heatmap
+pheatmap(as.matrix(sample_dists), main = "Sample Distance Heatmap", fontsize_row = 6, fontsize_col = 6)
+
+#Visualize using PCA plot
+plotPCA(rld, intgroup='batch')
+```
+
+*The sample distance heatmap is used to visualize the overall similarity between the samples. The heatmap shows that there is a higher degree of similarity between the replicates of cerebrum as compared to the replicates of cerebellum. The samples from the two groups show are not similar at all.*
+
+*This is also confirmed by the PCA plot where the groups exhibit 93% variability*
+
+**Create DGElist to visualize Biological Coefficient of variation**
+
+```{r, convert the data to DGEList, cache=TRUE, echo=FALSE}
+#Create DGElist/object for edgeR
+dge <- DGEList(counts = data_corrected, genes = rownames(data_corrected))
+#Create groups based on the location in brain. Classify 202 data as cerebellum and the other two as cerebrum
+group <- factor(c(rep("Mid_Hind_brain", 6), rep("Forebrain_Cerebrum", 6)))
+#Assign the groups to dge list
+dge$samples$group <- group
+dge$samples
+
+#Visulaize total counts per sample
+total_counts <- colSums(dge$counts)
+barplot(
+total_counts,
+main = "Total Counts Per Sample",
+xlab = "Samples",
+ylab = "Total Counts",
+col = "skyblue",
+las = 2  # Rotate sample names for better readability
+)
+```
+
+**Normalize the data**
+
+```{r, Normalization, cache=TRUE, echo=FALSE}
+#Normalize the data
+dge <- calcNormFactors(dge)
+dge$samples$norm.factors
+
+#normalize counts
+#cpm refers to counts per million. this is to ensure that normalization factors are applied
+normalized_counts <- cpm(dge, normalized.lib.sizes = TRUE)
+barplot(
+normalized_counts,main = "Normalized Counts Per Sample",xlab = "Samples",ylab = "Normalized Counts",col = "maroon",las = 2)
+
+#Create design matrix by group
+design <- model.matrix(~group)
+dge <- estimateDisp(dge, design)
+dge <- estimateTagwiseDisp(dge)
+plotBCV(dge)
+
+```
+
+*The BCV plot shows that most genes fall under 0.5 on the y-axis indicating about 50% variability between the samples*
+
+**Differential Expression Analysis**
+
+```{r, DE Analysis, echo=FALSE, cache=TRUE}
+dds <- DESeq(dds)
+res <- results(dds)
+
+#Extract significant genes
+significant_genes <- rownames(subset(res, padj < 0.05 & abs(log2FoldChange) > 1))
+#Extract normalized/log transformed counts for the genes
+norm_counts <- assay(rlog(dds))[significant_genes, ]
+#Scale the data
+scaled_counts <- t(scale(t(norm_counts)))
+
+#To view heatmap of top 25 up & down-regulated genes
+#take subset of scaled counts
+#To subset top significant genes
+#First check for NA in padj
+sum(is.na(res$padj))
+#Filter out NA
+res_sorted <- res[!is.na(res$padj) & res$padj < 0.05, ]
+# Verify sorted results by log2 fold change
+res_sorted <- res_sorted[order(res_sorted$log2FoldChange, decreasing = TRUE), ]
+# Top 25 upregulated genes
+top_up <- head(rownames(res_sorted), 25)
+# Top 25 downregulated genes
+top_down <- head(rownames(res_sorted[order(res_sorted$log2FoldChange), ]), 25)
+# Combine
+top_genes <- c(top_up, top_down)
+#Subset scaled counts
+scaled_counts_subset <- scaled_counts[top_genes, ]
+
+#Heatmap
+color <- colorRampPalette(c("navy", "white", "firebrick3"))(50)
+pheatmap(scaled_counts_subset, cluster_rows = TRUE, cluster_cols = TRUE, fontsize_row = 6, fontsize_col=6, scale = "row", show_rownames = TRUE, color=color)
+
+```
+
+*The heatmap shows top 25 up-regulated and downregulated genes in both the areas of brain*
+
+**Pathway enrichment analysis**
+
+```{r, pathway analysis, cache=TRUE, echo=FALSE}
+#Perform enrichment analysis
+enrichment_BP <- enrichGO(
+gene = rownames(res),
+OrgDb = org.Mm.eg.db,
+keyType = "SYMBOL",
+ont = "BP",
+pvalueCutoff = 0.05
+)
+
+#Visualize the results
+dotplot(enrichment_BP, showCategory = 20) +
+ggtitle("GO Enrichment_BP")
+
+enrichment_MF <- enrichGO(
+gene = rownames(res),
+OrgDb = org.Mm.eg.db,
+keyType = "SYMBOL",
+ont = "MF",
+pvalueCutoff = 0.05
+)
+
+#Visualize the results
+dotplot(enrichment_MF, showCategory = 20) +
+ggtitle("GO Enrichment_MF")
+
+enrichment_CC <- enrichGO(
+gene = rownames(res),
+OrgDb = org.Mm.eg.db,
+keyType = "SYMBOL",
+ont = "CC",
+pvalueCutoff = 0.05
+)
+
+#Visualize the results
+dotplot(enrichment_CC, showCategory = 20) +
+ggtitle("GO Enrichment_CC")
+
+```
+
+When you save the notebook, an HTML file containing the code and output will be saved alongside it (click the *Preview* button or press *Ctrl+Shift+K* to preview the HTML file).
+
+The preview shows you a rendered HTML copy of the contents of the editor. Consequently, unlike *Knit*, *Preview* does not run any R code chunks. Instead, the output of the chunk when it was last run in the editor is displayed.
